@@ -196,6 +196,7 @@ void returnToHomeTab();
 void pollE22Radio(bool force = false);
 bool handleLocalPacket(String packet, int16_t rssi);
 void showRestartLoadingScreen();
+void drawHomeDetailsContent(bool fullRedraw = true);
 
 // App index/tab mapping (0=Home,1=User,2=Chat,3=Map,4=Records,5=Config,6=Settings,7=About,8=Restart)
 int sidebarTab = 0;
@@ -211,8 +212,10 @@ const int HOME_APP_COLS = 5;
 const int HOME_APP_ROWS = 2;
 const int HOME_APP_VISIBLE = HOME_APP_COLS * HOME_APP_ROWS;
 int homeDetailsTopIndex = 0;
+int prevHomeDetailsThumbY = -1;
+int prevHomeDetailsThumbH = 0;
 const int HOME_DETAILS_ROW_COUNT = 13;
-const int HOME_DETAILS_VISIBLE_ROWS = 4;
+const int HOME_DETAILS_VISIBLE_ROWS = 7;
 
 // Config menu
 int configIndex = 0;
@@ -2148,15 +2151,16 @@ void drawHomeStatus() {
 
   tft.fillScreen(C_BG);
 
-  tft.setTextSize(2);
+  tft.setTextSize(3);
   tft.setTextColor(C_TEXT);
   tft.setCursor(14, 14);
   tft.print("LomhorOS");
 
   drawTopWifiIcon(235, 10, C_TEXT);
-  drawTopRadioIcon(268, 9, e22Ready ? C_TEXT : C_MUTED);
+  drawTopRadioIcon(268, 9, e22Ready ? C_TEXT : C_ERROR);
   drawTopBatteryIcon(303, 10, C_ERROR, 100);
-
+  
+  tft.setTextSize(2);
   tft.setCursor(14, 55);
   tft.print(dateText);
 
@@ -2168,10 +2172,10 @@ void drawHomeStatus() {
   drawHomeAppList();
 }
 
-void drawHomeDetailsContent() {
-  int x = 10;
-  int y = 8;
-  int w = 300;
+void drawHomeDetailsContent(bool fullRedraw) {
+  int x = 8;
+  int y = 6;
+  int w = 304;
   String heapText = String("Heap ") + String(ESP.getFreeHeap() / 1024) + "k";
   String flashText = String("Flash ") + String(ESP.getFlashChipSize() / (1024 * 1024)) + "MB";
   String psramText = String("PSRAM ") + String(ESP.getPsramSize() / (1024 * 1024)) + "MB";
@@ -2224,85 +2228,100 @@ void drawHomeDetailsContent() {
   if (homeDetailsTopIndex < 0) homeDetailsTopIndex = 0;
   if (homeDetailsTopIndex > maxTop) homeDetailsTopIndex = maxTop;
 
-  tft.fillRect(0, 0, 320, 240, C_BG);
-  tft.fillRoundRect(x, y, w, 32, 10, C_PANEL);
-  tft.drawRoundRect(x, y, w, 32, 10, C_ACCENT);
-  tft.fillRoundRect(x + 5, y + 5, 5, 22, 3, C_ACCENT);
-  tft.setTextSize(2);
-  tft.setTextColor(C_TEXT);
-  tft.setCursor(x + 16, y + 8);
-  tft.print("System");
+  int cardY = y + 36;
+  int cardW = (w - 6) / 2;
+  int listY = cardY + 38;
+  int rowH = 20;
+  int rowGap = 2;
+  int listH = HOME_DETAILS_VISIBLE_ROWS * (rowH + rowGap) - rowGap;
 
-  tft.setTextSize(1);
-  tft.setTextColor(C_MUTED);
-  tft.setCursor(x + w - 82, y + 8);
-  tft.print("Dashboard");
-  tft.setCursor(x + w - 55, y + 20);
-  tft.print("LEFT back");
+  if (fullRedraw) {
+    tft.fillRect(0, 0, 320, 240, C_BG);
 
-  int chipY = y + 40;
-  int chipW = (w - 8) / 2;
-  tft.fillRoundRect(x, chipY, chipW, 36, 8, C_TILE_BG);
-  tft.drawRoundRect(x, chipY, chipW, 36, 8, e22Ready ? C_ACCENT : C_ERROR);
-  drawIconSignal(x + 9, chipY + 12, e22Ready ? C_ACCENT : C_ERROR);
-  tft.setTextColor(C_MUTED);
-  tft.setCursor(x + 31, chipY + 6);
-  tft.print("Radio");
-  tft.setTextColor(e22Ready ? C_ACCENT : C_ERROR);
-  tft.setCursor(x + 31, chipY + 21);
-  tft.print(e22Ready ? radioFrequencyText() : "Offline");
+    tft.fillRoundRect(x, y, w, 28, 7, C_HEADER_BG);
+    tft.drawRoundRect(x, y, w, 28, 7, C_BORDER);
+    tft.fillCircle(x + 10, y + 14, 3, e22Ready ? C_GREEN : C_ERROR);
+    tft.fillCircle(x + 21, y + 14, 3, sdReady ? C_CYAN : C_MUTED);
+    tft.fillCircle(x + 32, y + 14, 3, C_WARN);
+    tft.setTextSize(1);
+    tft.setTextColor(C_TEXT);
+    tft.setCursor(x + 44, y + 7);
+    tft.print("Home Details");
+    tft.setTextColor(C_MUTED);
+    tft.setCursor(x + 44, y + 18);
+    tft.print(currentLauncherDateText());
+    tft.setTextColor(C_ACCENT);
+    tft.setCursor(x + w - 58, y + 11);
+    tft.print("LEFT Back");
 
-  tft.fillRoundRect(x + chipW + 8, chipY, chipW, 36, 8, C_TILE_BG);
-  tft.drawRoundRect(x + chipW + 8, chipY, chipW, 36, 8, C_CYAN);
-  drawIconMsg(x + chipW + 18, chipY + 11, C_CYAN);
-  tft.setTextColor(C_MUTED);
-  tft.setCursor(x + chipW + 40, chipY + 6);
-  tft.print("Traffic");
-  tft.setTextColor(C_TEXT);
-  tft.setCursor(x + chipW + 40, chipY + 21);
-  tft.print(trafficText);
+    tft.fillRoundRect(x, cardY, cardW, 30, 6, C_PANEL);
+    tft.drawRoundRect(x, cardY, cardW, 30, 6, e22Ready ? C_GREEN : C_ERROR);
+    drawIconSignal(x + 8, cardY + 8, e22Ready ? C_GREEN : C_ERROR);
+    tft.setTextColor(C_MUTED);
+    tft.setCursor(x + 30, cardY + 5);
+    tft.print("Radio");
+    tft.setTextColor(e22Ready ? C_GREEN : C_ERROR);
+    tft.setCursor(x + 30, cardY + 17);
+    tft.print(e22Ready ? radioFrequencyText() : "Offline");
 
-  int listY = chipY + 44;
-  int rowH = 28;
-  int rowGap = 5;
-  int listH = HOME_DETAILS_VISIBLE_ROWS * (rowH + rowGap) - rowGap + 12;
-  tft.fillRoundRect(x, listY - 6, w, listH, 10, C_PANEL);
-  tft.drawRoundRect(x, listY - 6, w, listH, 10, C_BORDER);
-  tft.fillRoundRect(x + w - 18, listY - 2, 12, listH - 8, 6, C_TILE_BG);
+    tft.fillRoundRect(x + cardW + 6, cardY, cardW, 30, 6, C_PANEL);
+    tft.drawRoundRect(x + cardW + 6, cardY, cardW, 30, 6, C_CYAN);
+    drawIconMsg(x + cardW + 14, cardY + 8, C_CYAN);
+    tft.setTextColor(C_MUTED);
+    tft.setCursor(x + cardW + 36, cardY + 5);
+    tft.print("Traffic");
+    tft.setTextColor(C_TEXT);
+    tft.setCursor(x + cardW + 36, cardY + 17);
+    tft.print(trafficText);
+
+    tft.fillRoundRect(x, listY - 4, w, listH + 8, 7, C_PANEL);
+    tft.drawRoundRect(x, listY - 4, w, listH + 8, 7, C_BORDER);
+  } else {
+    tft.fillRect(x + 4, listY - 1, w - 22, listH + 2, C_PANEL);
+  }
+
   for (int slot = 0; slot < HOME_DETAILS_VISIBLE_ROWS; slot++) {
     int rowIndex = homeDetailsTopIndex + slot;
     if (rowIndex >= HOME_DETAILS_ROW_COUNT) break;
-    drawDashboardTile(x + 6, listY + slot * (rowH + rowGap), w - 24, rowH, icons[rowIndex], labels[rowIndex], values[rowIndex], colors[rowIndex], true);
+    int rowY = listY + slot * (rowH + rowGap);
+    uint16_t rowBg = (slot % 2 == 0) ? C_TILE_BG : C_CARD_BG;
+    tft.fillRoundRect(x + 5, rowY, w - 17, rowH, 4, rowBg);
+    tft.fillRoundRect(x + 5, rowY + 4, 3, rowH - 8, 2, colors[rowIndex]);
+
+    uint16_t iconCol = colors[rowIndex] == C_ERROR ? C_ERROR : C_MUTED;
+    if (icons[rowIndex] == 0) drawIconMsg(x + 13, rowY + 3, iconCol);
+    else if (icons[rowIndex] == 1) drawIconNodes(x + 13, rowY + 3, iconCol);
+    else if (icons[rowIndex] == 2) drawIconSignal(x + 13, rowY + 3, iconCol);
+    else if (icons[rowIndex] == 3) drawIconSd(x + 13, rowY + 3, iconCol);
+    else drawIconInfo(x + 13, rowY + 3, iconCol);
+
+    String label = fitDashboardText(labels[rowIndex], 13);
+    String value = fitDashboardText(values[rowIndex], 25);
+    tft.setTextSize(1);
+    tft.setTextColor(C_MUTED);
+    tft.setCursor(x + 35, rowY + 6);
+    tft.print(label);
+    tft.setTextColor(colors[rowIndex]);
+    tft.setCursor(x + 119, rowY + 6);
+    tft.print(value);
   }
 
   if (HOME_DETAILS_ROW_COUNT > HOME_DETAILS_VISIBLE_ROWS) {
-    int trackX = x + w - 15;
-    int trackY = listY + 13;
-    int trackH = listH - 34;
+    int trackX = x + w - 9;
+    int trackY = listY + 2;
+    int trackH = listH - 4;
     int thumbH = trackH * HOME_DETAILS_VISIBLE_ROWS / HOME_DETAILS_ROW_COUNT;
-    if (thumbH < 18) thumbH = 18;
+    if (thumbH < 16) thumbH = 16;
     int thumbY = maxTop == 0 ? trackY : trackY + (trackH - thumbH) * homeDetailsTopIndex / maxTop;
 
-    tft.fillTriangle(trackX + 5, listY + 2, trackX + 1, listY + 8, trackX + 9, listY + 8, homeDetailsTopIndex > 0 ? C_ACCENT : C_NAV_SLOT);
-    tft.fillTriangle(trackX + 5, listY + listH - 8,
-                     trackX + 1, listY + listH - 14,
-                     trackX + 9, listY + listH - 14,
-                     homeDetailsTopIndex < maxTop ? C_ACCENT : C_NAV_SLOT);
-    tft.fillRoundRect(trackX + 2, trackY, 7, trackH, 4, C_NAV_SLOT);
-    tft.fillRoundRect(trackX + 4, trackY + 2, 3, trackH - 4, 2, C_PANEL);
-    tft.fillRoundRect(trackX, thumbY, 11, thumbH, 5, C_ACCENT);
-    tft.fillRoundRect(trackX + 3, thumbY + 3, 5, thumbH - 6, 3, C_CYAN);
-
-    int pageEnd = homeDetailsTopIndex + HOME_DETAILS_VISIBLE_ROWS;
-    if (pageEnd > HOME_DETAILS_ROW_COUNT) pageEnd = HOME_DETAILS_ROW_COUNT;
-    String pageText = String(homeDetailsTopIndex + 1) + "-" + String(pageEnd) + "/" + String(HOME_DETAILS_ROW_COUNT);
-    tft.setTextSize(1);
-    int pageW = pageText.length() * 6 + 10;
-    tft.fillRoundRect(x + w - pageW, 224, pageW, 13, 5, C_TILE_BG);
-    tft.drawRoundRect(x + w - pageW, 224, pageW, 13, 5, C_ACCENT);
-    tft.setTextColor(C_TEXT);
-    tft.setCursor(x + w - pageW + 5, 227);
-    tft.print(pageText);
+    if (fullRedraw || prevHomeDetailsThumbY < 0) {
+      tft.fillRoundRect(trackX, trackY, 4, trackH, 2, C_NAV_SLOT);
+    } else if (thumbY != prevHomeDetailsThumbY || thumbH != prevHomeDetailsThumbH) {
+      tft.fillRoundRect(trackX, prevHomeDetailsThumbY, 4, prevHomeDetailsThumbH, 2, C_NAV_SLOT);
+    }
+    tft.fillRoundRect(trackX, thumbY, 4, thumbH, 2, C_ACCENT);
+    prevHomeDetailsThumbY = thumbY;
+    prevHomeDetailsThumbH = thumbH;
   }
 }
 
@@ -2310,6 +2329,7 @@ void drawHomeDetailsScreen() {
   screenMode = SCREEN_HOME_DETAILS;
   sidebarTab = 0;
   homeDetailsTopIndex = 0;
+  prevHomeDetailsThumbY = -1;
   drawHomeDetailsContent();
 }
 
@@ -2527,11 +2547,15 @@ void handleHomeScreen(String joy) {
 
 void handleHomeDetailsScreen(String joy) {
   if (joy == "UP") {
+    if (homeDetailsTopIndex <= 0) return;
     homeDetailsTopIndex--;
-    drawHomeDetailsContent();
+    drawHomeDetailsContent(false);
   } else if (joy == "DOWN") {
+    int maxTop = HOME_DETAILS_ROW_COUNT - HOME_DETAILS_VISIBLE_ROWS;
+    if (maxTop < 0) maxTop = 0;
+    if (homeDetailsTopIndex >= maxTop) return;
     homeDetailsTopIndex++;
-    drawHomeDetailsContent();
+    drawHomeDetailsContent(false);
   } else if (joy == "LEFT" || joy == "SELECT") {
     returnToHomeTab();
   }
