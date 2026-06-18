@@ -1,0 +1,9 @@
+profiles:
+  esp32s3-n16r8:
+    fqbn: esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB
+    platforms:
+      - platform: esp32:esp32
+    libraries:
+      - Adafruit GFX Library
+      - Adafruit ILI9341
+      - EByte LoRa E22 library

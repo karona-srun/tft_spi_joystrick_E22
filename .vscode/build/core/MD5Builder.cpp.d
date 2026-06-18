@@ -1,0 +1,20 @@
+/Users/karonasrun/Documents/Arduino/TFT_SPI_JOYStrick_E22/.vscode/build/core/MD5Builder.cpp.o: \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/MD5Builder.cpp \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/HEXBuilder.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/WString.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/pgmspace.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/newlib/platform_include/ctype.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/Stream.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/Print.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/newlib/platform_include/stdio.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/WString.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/Printable.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/MD5Builder.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/esp_system/include/esp_system.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/esp_common/include/esp_err.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/esp_common/include/esp_compiler.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/esp_common/include/esp_attr.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/esp_common/include/esp_bit_defs.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/esp_common/include/esp_idf_version.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/tools/esp32s3-libs/3.3.8/include/esp_rom/include/esp_rom_md5.h \
+ /Users/karonasrun/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8/cores/esp32/HashBuilder.h
