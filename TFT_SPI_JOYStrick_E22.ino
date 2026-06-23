@@ -1,9 +1,15 @@
 #include <SPI.h>
+#include <Wire.h>
 #include <SD.h>
 #include <FS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#define ENABLE_BLE_NETWORK 0
+#if ENABLE_BLE_NETWORK
+#include <NimBLEDevice.h>
+#endif
 #include <mbedtls/base64.h>
 #include <time.h>
 #define FREQUENCY_915
@@ -38,10 +44,11 @@ const uint8_t POWER_22 = POWER_30;
 #define SD_MISO   3
 
 #define JOY_PIN   4
-#define BACK_BTN_PIN 35
-#define HOME_BTN_PIN 36
+#define BACK_BTN_PIN 38
+#define HOME_BTN_PIN 39
 #define BUZZER_PIN 37
 #define ACTIVE_BUZZER true
+#define BATTERY_PIN 19
 
 #if TFT_CS == SD_CS
 #error "TFT_CS and SD_CS must be different."
@@ -79,11 +86,24 @@ const uint8_t POWER_22 = POWER_30;
 #define E22_M0    14
 #define E22_M1    15
 
+// GPS wiring.
+// ESP32 RXD GPIO35 connects to GPS TX.
+// ESP32 TXD GPIO36 connects to GPS RX.
+// Optional GPS I2C/Qwiic: SDA GPIO1, SCL GPIO2.
+#define GPS_UART_RXD 35
+#define GPS_UART_TXD 36
+#define GPS_I2C_SDA  1
+#define GPS_I2C_SCL  2
+#define GPS_BAUD     115200
+
 #define BL_FREQ     20000
 #define BL_RES      10
 #define BL_DUTY_MAX ((1 << BL_RES) - 1)
 #define MIN_BRIGHTNESS_PERCENT 35
 #define SD_SPI_FREQ 4000000
+#define BATTERY_DIVIDER_RATIO 2.0f
+#define BATTERY_EMPTY_MV 3300
+#define BATTERY_FULL_MV 4200
 
 const char* HARDWARE_TARGET = "ESP32-S3 N16R8";
 
@@ -102,6 +122,7 @@ uint8_t E22_TX_POWER = POWER_30;
 Adafruit_ILI9341 tft = Adafruit_ILI9341(&SPI, TFT_DC, TFT_CS, TFT_RST);
 SPIClass sdSPI(HSPI);
 LoRa_E22 e22ttl(E22_RXD, E22_TXD, &Serial2, E22_AUX, E22_M0, E22_M1, UART_BPS_RATE_9600, SERIAL_8N1);
+HardwareSerial gpsSerial(1);
 Preferences storage;
 
 // ===================== LOMHOR OS PALETTE =====================
@@ -128,6 +149,7 @@ Preferences storage;
 #define C_YELLOW     0xFEA0
 #define C_CYAN       0x8E7F
 #define C_RED_SOFT   0xF9E7
+#define C_RESTART_BG 0xF800
 
 // Mobile-style full-screen content. The old sidebar is replaced by Home app icons.
 #define SIDEBAR_W    0
@@ -179,6 +201,7 @@ enum ScreenMode {
   SCREEN_CHAT_KEYBOARD,
   SCREEN_CHAT_SEND_TO,
   SCREEN_MAP,
+  SCREEN_LOCATION,
   SCREEN_FILE_MANAGER,
   SCREEN_TEXT_VIEWER,
   SCREEN_JOYSTICK_TEST,
@@ -197,24 +220,25 @@ void pollE22Radio(bool force = false);
 bool handleLocalPacket(String packet, int16_t rssi);
 void showRestartLoadingScreen();
 void drawHomeDetailsContent(bool fullRedraw = true);
+void initNetworkDevices();
 
-// App index/tab mapping (0=Home,1=User,2=Chat,3=Map,4=Records,5=Config,6=Settings,7=About,8=Restart)
+// App index/tab mapping (0=Home,1=User,2=Chat,3=Map,4=Location,5=Records,6=Config,7=Settings,8=About,9=Restart)
 int sidebarTab = 0;
-const int SIDEBAR_TABS = 9;
+const int SIDEBAR_TABS = 10;
 int sidebarTopTab = 0;
 const int SIDEBAR_VISIBLE_TABS = 6;
 const int SIDEBAR_TAB_Y = 12;
 const int SIDEBAR_TAB_STEP = 38;
 int homeAppIndex = 0;
 int homeAppTopIndex = 0;
-const int HOME_APP_COUNT = 9;
+const int HOME_APP_COUNT = 10;
 const int HOME_APP_COLS = 5;
 const int HOME_APP_ROWS = 2;
 const int HOME_APP_VISIBLE = HOME_APP_COLS * HOME_APP_ROWS;
 int homeDetailsTopIndex = 0;
 int prevHomeDetailsThumbY = -1;
 int prevHomeDetailsThumbH = 0;
-const int HOME_DETAILS_ROW_COUNT = 13;
+const int HOME_DETAILS_ROW_COUNT = 16;
 const int HOME_DETAILS_VISIBLE_ROWS = 7;
 
 // Config menu
@@ -225,13 +249,19 @@ int configPowerIndex = 0;  // E22-900T33S: 30dBm, 27dBm, 24dBm, 21dBm
 
 // Settings menu
 int settingsIndex = 0;
-const int settingsCount = 3;
+const int settingsCount = 6;
 int displayTextSize = 1;
 bool alertSoundOn = true;
 int sleepModeIndex = 4;    // 10s, 30s, 1m, 5m, Never
+bool wifiApEnabled = true;
+bool bluetoothEnabled = false;
+bool wifiApReady = false;
+bool bluetoothReady = false;
+String wifiApPassword = "12345678";
 unsigned long lastActivityTime = 0;
 unsigned long lastBrightnessRefresh = 0;
 unsigned long lastHomeClockRefresh = 0;
+unsigned long lastHomeTopStatusRefresh = 0;
 bool displaySleeping = false;
 
 void initBuzzer() {
@@ -302,6 +332,7 @@ const char* appVersion = "v0.0.20";
 const char* username = "Karona SRUN";
 const char* STORAGE_NAMESPACE = "lomhor";
 const char* CHAT_LOG_DIR = "/chat";
+const char* BLE_SERVICE_UUID = "74f90001-05a5-4a65-9d6a-7f1d8f224001";
 
 bool e22Ready = false;
 String e22StatusText = "Radio starting";
@@ -318,6 +349,35 @@ String awaitingAckId = "";
 bool awaitingAckReceived = false;
 int userTopIndex = 0;
 
+bool gpsUartReady = false;
+bool gpsI2cReady = false;
+bool gpsHasFix = false;
+bool gpsDateValid = false;
+String gpsStatusText = "GPS starting";
+String gpsLineBuffer = "";
+double gpsLatitude = 0.0;
+double gpsLongitude = 0.0;
+float gpsAltitudeM = 0.0f;
+float gpsSpeedKmh = 0.0f;
+float gpsCourseDeg = 0.0f;
+float gpsHdop = 0.0f;
+uint8_t gpsSatellites = 0;
+uint8_t gpsFixQuality = 0;
+String gpsUtcTime = "--:--:--";
+String gpsUtcDate = "----/--/--";
+String lastGpsSentence = "No NMEA";
+unsigned long lastGpsCharMs = 0;
+unsigned long lastGpsSentenceMs = 0;
+unsigned long lastGpsFixMs = 0;
+unsigned long lastGpsUiRefresh = 0;
+int locationTopIndex = 0;
+const int LOCATION_ROW_COUNT = 10;
+const int LOCATION_VISIBLE_ROWS = 3;
+const uint32_t GPS_BAUD_CANDIDATES[] = {GPS_BAUD, 115200};
+const uint8_t GPS_BAUD_CANDIDATE_COUNT = sizeof(GPS_BAUD_CANDIDATES) / sizeof(GPS_BAUD_CANDIDATES[0]);
+uint8_t gpsBaudIndex = 0;
+uint32_t gpsActiveBaud = GPS_BAUD;
+
 void clampStoredOptions() {
   if (brightnessPercent < MIN_BRIGHTNESS_PERCENT) brightnessPercent = MIN_BRIGHTNESS_PERCENT;
   if (brightnessPercent > 100) brightnessPercent = 100;
@@ -326,6 +386,7 @@ void clampStoredOptions() {
   if (sleepModeIndex < 0 || sleepModeIndex > 4) sleepModeIndex = 4;
   if (configModeIndex < 0 || configModeIndex > 1) configModeIndex = 0;
   if (configPowerIndex < 0 || configPowerIndex > 3) configPowerIndex = 0;
+  if (wifiApPassword.length() < 8 || wifiApPassword.length() > 63) wifiApPassword = "12345678";
 }
 
 void loadStoredOptions() {
@@ -338,6 +399,9 @@ void loadStoredOptions() {
   displayTextSize = storage.getInt("txtSize", displayTextSize);
   alertSoundOn = storage.getBool("alert", alertSoundOn);
   sleepModeIndex = storage.getInt("sleep", sleepModeIndex);
+  wifiApEnabled = storage.getBool("wifiAp", wifiApEnabled);
+  wifiApPassword = storage.getString("wifiPass", wifiApPassword);
+  bluetoothEnabled = storage.getBool("ble", bluetoothEnabled);
   configModeIndex = storage.getInt("mode", configModeIndex);
   configPowerIndex = storage.getInt("power", configPowerIndex);
   storage.end();
@@ -358,6 +422,9 @@ void saveSettingsToStorage() {
   storage.putInt("txtSize", displayTextSize);
   storage.putBool("alert", alertSoundOn);
   storage.putInt("sleep", sleepModeIndex);
+  storage.putBool("wifiAp", wifiApEnabled);
+  storage.putString("wifiPass", wifiApPassword);
+  storage.putBool("ble", bluetoothEnabled);
   storage.end();
   Serial.println("Settings saved to ESP32 storage");
 }
@@ -419,6 +486,9 @@ const char* chatPresets[] = {
 String freeTextMessage = "";
 String pendingChatMessage = "";
 bool pendingChatFromFreeText = false;
+String wifiPasswordEdit = "";
+bool keyboardEditingWifiPassword = false;
+bool wifiPasswordTooShort = false;
 int keyboardIndex = 0;
 int sendTargetIndex = 0;
 int sendTargetTopIndex = 0;
@@ -560,30 +630,38 @@ void drawIconSignal(int x, int y, uint16_t col) {
 }
 
 void drawTopWifiIcon(int x, int y, uint16_t col) {
-  tft.drawCircle(x + 12, y + 12, 12, col);
-  tft.drawCircle(x + 12, y + 12, 8, col);
-  tft.drawCircle(x + 12, y + 12, 4, col);
-  tft.fillRect(x - 1, y + 12, 28, 15, C_BG);
-  tft.fillCircle(x + 12, y + 18, 2, col);
+  tft.drawCircle(x + 9, y + 9, 9, col);
+  tft.drawCircle(x + 9, y + 9, 6, col);
+  tft.drawCircle(x + 9, y + 9, 3, col);
+  tft.fillRect(x - 1, y + 9, 22, 11, C_ACCENT);
+  tft.fillCircle(x + 9, y + 14, 2, col);
+}
+
+void drawTopGpsIcon(int x, int y, uint16_t col) {
+  tft.drawCircle(x + 7, y + 6, 5, col);
+  tft.fillCircle(x + 7, y + 6, 1, col);
+  tft.drawLine(x + 3, y + 10, x + 7, y + 18, col);
+  tft.drawLine(x + 11, y + 10, x + 7, y + 18, col);
+  tft.drawLine(x + 4, y + 11, x + 10, y + 11, col);
 }
 
 void drawTopRadioIcon(int x, int y, uint16_t col) {
-  tft.drawFastVLine(x + 12, y + 3, 22, col);
-  tft.fillCircle(x + 12, y + 14, 3, col);
-  tft.drawCircle(x + 12, y + 14, 9, col);
-  tft.drawCircle(x + 12, y + 14, 15, col);
-  tft.fillRect(x + 8, y - 2, 9, 32, C_BG);
-  tft.drawFastVLine(x + 12, y + 3, 22, col);
-  tft.fillCircle(x + 12, y + 14, 3, col);
+  tft.drawFastVLine(x + 9, y + 2, 17, col);
+  tft.fillCircle(x + 9, y + 11, 2, col);
+  tft.drawCircle(x + 9, y + 11, 7, col);
+  tft.drawCircle(x + 9, y + 11, 11, col);
+  tft.fillRect(x + 6, y - 1, 7, 24, C_ACCENT);
+  tft.drawFastVLine(x + 9, y + 2, 17, col);
+  tft.fillCircle(x + 9, y + 11, 2, col);
 }
 
 void drawTopBatteryIcon(int x, int y, uint16_t col, int percent) {
   if (percent < 0) percent = 0;
   if (percent > 100) percent = 100;
-  tft.drawRoundRect(x, y + 3, 12, 24, 2, col);
-  tft.fillRect(x + 4, y, 4, 3, col);
-  int fillH = percent * 18 / 100;
-  tft.fillRect(x + 3, y + 25 - fillH, 6, fillH, col);
+  tft.drawRoundRect(x, y + 3, 10, 18, 2, col);
+  tft.fillRect(x + 3, y, 4, 3, col);
+  int fillH = percent * 13 / 100;
+  tft.fillRect(x + 3, y + 19 - fillH, 4, fillH, col);
 }
 
 void drawMiniSignalBars(int x, int y, int bars, uint16_t col) {
@@ -602,6 +680,34 @@ int e22SignalBars() {
   if (lastRssiSignal > -85) return 3;
   if (lastRssiSignal > -105) return 2;
   return 1;
+}
+
+uint16_t readBatteryMv() {
+  uint32_t total = 0;
+  const int samples = 12;
+  for (int i = 0; i < samples; i++) {
+    total += analogReadMilliVolts(BATTERY_PIN);
+    delayMicroseconds(250);
+  }
+  float pinMv = (float)total / samples;
+  return (uint16_t)(pinMv * BATTERY_DIVIDER_RATIO + 0.5f);
+}
+
+int batteryPercentFromMv(uint16_t mv) {
+  int percent = map(constrain(mv, BATTERY_EMPTY_MV, BATTERY_FULL_MV), BATTERY_EMPTY_MV, BATTERY_FULL_MV, 0, 100);
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  return percent;
+}
+
+int batteryPercent() {
+  return batteryPercentFromMv(readBatteryMv());
+}
+
+uint16_t batteryColor(int percent) {
+  if (percent <= 15) return C_ERROR;
+  if (percent <= 30) return C_WARN;
+  return C_TEXT;
 }
 
 void drawBatteryIcon(int x, int y, int percent) {
@@ -630,7 +736,8 @@ void drawIconInfo(int x, int y, uint16_t col) {
 int sidebarBitmapIndex(int tabIndex) {
   if (tabIndex <= 2) return tabIndex;
   if (tabIndex == 3) return -1;
-  if (tabIndex <= 7) return tabIndex - 1;
+  if (tabIndex == 4) return -1;
+  if (tabIndex <= 8) return tabIndex - 2;
   return 5;
 }
 
@@ -840,6 +947,13 @@ String getSettingsValue(int i) {
   if (i == 0) return String(brightnessPercent) + "%";
   if (i == 1) return alertSoundOn ? "ON" : "OFF";
   if (i == 2) return String(sleepModes[sleepModeIndex]);
+  if (i == 3) return wifiApEnabled ? (wifiApReady ? "ON" : "START") : "OFF";
+  if (i == 4) return String(wifiApPassword.length()) + " chars";
+#if ENABLE_BLE_NETWORK
+  if (i == 5) return bluetoothEnabled ? (bluetoothReady ? "ON" : "START") : "OFF";
+#else
+  if (i == 5) return "Use app3M";
+#endif
   return "";
 }
 
@@ -861,6 +975,71 @@ String toHex4(uint16_t value) {
   char buf[5];
   snprintf(buf, sizeof(buf), "%04X", value);
   return String(buf);
+}
+
+String networkDeviceName() {
+  return String("Lomhor-") + toHex2(MY_ADDH) + toHex2(MY_ADDL);
+}
+
+String wifiApSsid() {
+  return networkDeviceName() + "-AP";
+}
+
+void initWifiAccessPoint() {
+  if (!wifiApEnabled) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiApReady = false;
+    Serial.println("WiFi AP disabled");
+    return;
+  }
+
+  WiFi.mode(WIFI_AP);
+  String ssid = wifiApSsid();
+  wifiApReady = WiFi.softAP(ssid.c_str(), wifiApPassword.c_str());
+  Serial.print("WiFi AP ");
+  Serial.print(wifiApReady ? "ready: " : "failed: ");
+  Serial.println(ssid);
+  if (wifiApReady) {
+    Serial.print("WiFi AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+}
+
+void initBluetoothBle() {
+#if ENABLE_BLE_NETWORK
+  if (!bluetoothEnabled) {
+    if (bluetoothReady) NimBLEDevice::deinit(true);
+    bluetoothReady = false;
+    Serial.println("Bluetooth BLE disabled");
+    return;
+  }
+
+  String name = networkDeviceName();
+  NimBLEDevice::init(name.c_str());
+  NimBLEServer *server = NimBLEDevice::createServer();
+  NimBLEService *service = server->createService(BLE_SERVICE_UUID);
+  service->start();
+
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  advertising->setName(name.c_str());
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->enableScanResponse(true);
+  advertising->start();
+  bluetoothReady = true;
+
+  Serial.print("Bluetooth BLE advertising: ");
+  Serial.println(name);
+#else
+  bluetoothReady = false;
+  bluetoothEnabled = false;
+  Serial.println("Bluetooth BLE disabled at compile time; use app3M partition and set ENABLE_BLE_NETWORK to 1.");
+#endif
+}
+
+void initNetworkDevices() {
+  initWifiAccessPoint();
+  initBluetoothBle();
 }
 
 int parseHexByte(String text) {
@@ -1030,7 +1209,7 @@ String currentLauncherDateText() {
   time_t now = time(nullptr);
   struct tm timeInfo;
   if (now > 1704067200 && localtime_r(&now, &timeInfo)) {
-    char buf[13];
+    char buf[16];
     snprintf(buf, sizeof(buf), "%02d.%s.%04d", timeInfo.tm_mday, monthNames[timeInfo.tm_mon], timeInfo.tm_year + 1900);
     return String(buf);
   }
@@ -1041,7 +1220,7 @@ String currentLauncherDateText() {
   int month = found ? ((found - months) / 3) : 0;
   int day = atoi(__DATE__ + 4);
   int year = atoi(__DATE__ + 7);
-  char buf[13];
+  char buf[16];
   snprintf(buf, sizeof(buf), "%02d.%s.%04d", day, monthNames[month], year);
   return String(buf);
 }
@@ -1050,7 +1229,7 @@ String uptimeText() {
   unsigned long minutes = millis() / 60000UL;
   unsigned long hours = minutes / 60UL;
   minutes %= 60UL;
-  char buf[18];
+  char buf[24];
   snprintf(buf, sizeof(buf), "up time: %02luh %02lum", hours, minutes);
   return String(buf);
 }
@@ -1807,7 +1986,7 @@ void showRadioReceiveStatus() {
   } else if (screenMode == SCREEN_USER) {
     drawUserContent();
   } else if (screenMode == SCREEN_HOME && sidebarTab == 0) {
-    drawHomeStatus();
+    drawHomeTopStatusIcons();
   } else if (screenMode == SCREEN_HOME_DETAILS) {
     drawHomeDetailsContent();
   } else if (screenMode == SCREEN_CHAT_SEND_TO) {
@@ -1841,6 +2020,201 @@ void pollE22Radio(bool force) {
       e22StatusText = rc.status.getResponseDescription();
       Serial.print("E22 RX failed: ");
       Serial.println(e22StatusText);
+    }
+  }
+}
+
+// ===================== GPS =====================
+
+String nmeaField(String sentence, int fieldIndex) {
+  int start = sentence.charAt(0) == '$' ? 1 : 0;
+  int current = 0;
+  for (int i = start; i <= sentence.length(); i++) {
+    char c = i < sentence.length() ? sentence.charAt(i) : ',';
+    if (c == ',' || c == '*') {
+      if (current == fieldIndex) return sentence.substring(start, i);
+      current++;
+      start = i + 1;
+    }
+  }
+  return "";
+}
+
+bool isValidNmeaChecksum(String sentence) {
+  sentence.trim();
+  if (!sentence.startsWith("$")) return false;
+  int star = sentence.indexOf('*');
+  if (star < 0 || star + 2 >= sentence.length()) return true;
+
+  uint8_t checksum = 0;
+  for (int i = 1; i < star; i++) checksum ^= (uint8_t)sentence.charAt(i);
+  String shown = sentence.substring(star + 1, star + 3);
+  int expected = parseHexByte(shown);
+  return expected >= 0 && checksum == (uint8_t)expected;
+}
+
+double parseNmeaCoordinate(String value, String hemisphere) {
+  if (value.length() < 4) return 0.0;
+  double raw = atof(value.c_str());
+  int degrees = (int)(raw / 100.0);
+  double minutes = raw - degrees * 100.0;
+  double decimal = degrees + minutes / 60.0;
+  if (hemisphere == "S" || hemisphere == "W") decimal = -decimal;
+  return decimal;
+}
+
+String formatDecimalDegrees(double value) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%.6f", value);
+  return String(buf);
+}
+
+String formatGpsTime(String hhmmss) {
+  if (hhmmss.length() < 6) return "--:--:--";
+  return hhmmss.substring(0, 2) + ":" + hhmmss.substring(2, 4) + ":" + hhmmss.substring(4, 6);
+}
+
+String formatGpsDate(String ddmmyy) {
+  if (ddmmyy.length() < 6) return "----/--/--";
+  int year = 2000 + ddmmyy.substring(4, 6).toInt();
+  return String(year) + "/" + ddmmyy.substring(2, 4) + "/" + ddmmyy.substring(0, 2);
+}
+
+String gpsFixText() {
+  if (!gpsUartReady) return "UART off";
+  if (millis() - lastGpsCharMs > 4000UL) return "No NMEA";
+  if (gpsHasFix) return String("Fix ") + String(gpsSatellites) + " sat";
+  if (gpsFixQuality > 0) return "Fix starting";
+  return "Searching";
+}
+
+void parseGpsRmc(String sentence) {
+  String status = nmeaField(sentence, 2);
+  String latText = nmeaField(sentence, 3);
+  String ns = nmeaField(sentence, 4);
+  String lonText = nmeaField(sentence, 5);
+  String ew = nmeaField(sentence, 6);
+  String speedText = nmeaField(sentence, 7);
+  String courseText = nmeaField(sentence, 8);
+  String dateText = nmeaField(sentence, 9);
+
+  gpsUtcTime = formatGpsTime(nmeaField(sentence, 1));
+  if (dateText.length() >= 6) {
+    gpsUtcDate = formatGpsDate(dateText);
+    gpsDateValid = true;
+  }
+
+  gpsHasFix = status == "A";
+  if (gpsHasFix && latText.length() > 0 && lonText.length() > 0) {
+    gpsLatitude = parseNmeaCoordinate(latText, ns);
+    gpsLongitude = parseNmeaCoordinate(lonText, ew);
+    gpsSpeedKmh = atof(speedText.c_str()) * 1.852f;
+    gpsCourseDeg = atof(courseText.c_str());
+    lastGpsFixMs = millis();
+    gpsStatusText = "GPS fix";
+  } else if (!gpsHasFix) {
+    gpsStatusText = "GPS searching";
+  }
+}
+
+void parseGpsGga(String sentence) {
+  String latText = nmeaField(sentence, 2);
+  String ns = nmeaField(sentence, 3);
+  String lonText = nmeaField(sentence, 4);
+  String ew = nmeaField(sentence, 5);
+
+  gpsUtcTime = formatGpsTime(nmeaField(sentence, 1));
+  gpsFixQuality = (uint8_t)nmeaField(sentence, 6).toInt();
+  gpsSatellites = (uint8_t)nmeaField(sentence, 7).toInt();
+  gpsHdop = atof(nmeaField(sentence, 8).c_str());
+  gpsAltitudeM = atof(nmeaField(sentence, 9).c_str());
+
+  if (gpsFixQuality > 0 && latText.length() > 0 && lonText.length() > 0) {
+    gpsHasFix = true;
+    gpsLatitude = parseNmeaCoordinate(latText, ns);
+    gpsLongitude = parseNmeaCoordinate(lonText, ew);
+    lastGpsFixMs = millis();
+    gpsStatusText = "GPS fix";
+  }
+}
+
+void handleGpsSentence(String sentence) {
+  sentence.trim();
+  if (sentence.length() == 0) return;
+  lastGpsSentence = sentence;
+
+  if (!isValidNmeaChecksum(sentence)) {
+    gpsStatusText = "NMEA checksum";
+    return;
+  }
+
+  lastGpsSentenceMs = millis();
+  String type = nmeaField(sentence, 0);
+  if (type.endsWith("RMC")) parseGpsRmc(sentence);
+  else if (type.endsWith("GGA")) parseGpsGga(sentence);
+}
+
+bool scanGpsI2cBus() {
+  bool found = false;
+  for (uint8_t address = 0x08; address <= 0x77; address++) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      found = true;
+      break;
+    }
+  }
+  return found;
+}
+
+void initGps() {
+  Wire.begin(GPS_I2C_SDA, GPS_I2C_SCL);
+  Wire.setClock(100000);
+  gpsI2cReady = scanGpsI2cBus();
+
+  gpsBaudIndex = 0;
+  gpsActiveBaud = GPS_BAUD_CANDIDATES[gpsBaudIndex];
+  gpsSerial.begin(gpsActiveBaud, SERIAL_8N1, GPS_UART_RXD, GPS_UART_TXD);
+  gpsUartReady = true;
+  lastGpsSentenceMs = millis();
+  gpsStatusText = gpsI2cReady ? "GPS UART/I2C ready" : "GPS UART ready";
+
+  Serial.println("GPS wiring:");
+  Serial.printf("  UART RX GPIO%d <- GPS TX, TX GPIO%d -> GPS RX, baud %lu\n", GPS_UART_RXD, GPS_UART_TXD, (unsigned long)gpsActiveBaud);
+  Serial.printf("  I2C SDA GPIO%d, SCL GPIO%d: %s\n", GPS_I2C_SDA, GPS_I2C_SCL, gpsI2cReady ? "device found" : "no ACK");
+}
+
+void retryGpsBaud() {
+  if (GPS_BAUD_CANDIDATE_COUNT < 2) return;
+  if (millis() - lastGpsSentenceMs < 7000UL) return;
+
+  gpsBaudIndex = (gpsBaudIndex + 1) % GPS_BAUD_CANDIDATE_COUNT;
+  gpsActiveBaud = GPS_BAUD_CANDIDATES[gpsBaudIndex];
+  gpsSerial.end();
+  delay(20);
+  gpsSerial.begin(gpsActiveBaud, SERIAL_8N1, GPS_UART_RXD, GPS_UART_TXD);
+  gpsLineBuffer = "";
+  lastGpsCharMs = 0;
+  lastGpsSentenceMs = millis();
+  gpsStatusText = String("Trying ") + String(gpsActiveBaud);
+  Serial.printf("GPS: no valid NMEA, trying baud %lu\n", (unsigned long)gpsActiveBaud);
+}
+
+void pollGps() {
+  if (!gpsUartReady) return;
+  retryGpsBaud();
+
+  while (gpsSerial.available() > 0) {
+    char c = (char)gpsSerial.read();
+    lastGpsCharMs = millis();
+
+    if (c == '$') {
+      gpsLineBuffer = "$";
+    } else if (c == '\n') {
+      if (gpsLineBuffer.length() > 6) handleGpsSentence(gpsLineBuffer);
+      gpsLineBuffer = "";
+    } else if (c != '\r') {
+      if (gpsLineBuffer.length() < 96) gpsLineBuffer += c;
+      else gpsLineBuffer = "";
     }
   }
 }
@@ -1889,7 +2263,6 @@ void drawDashboardTile(int x, int y, int w, int h, int icon, String label, Strin
 void drawHomeScreen() {
   screenMode = SCREEN_HOME;
   sidebarTab = 0;
-  tft.fillScreen(C_BG);
   drawHomeStatus();
 }
 
@@ -1909,10 +2282,11 @@ String homeAppTitle(int appIndex) {
   if (appIndex == 1) return "Nodes";
   if (appIndex == 2) return "Messages";
   if (appIndex == 3) return "Maps";
-  if (appIndex == 4) return "SD Card";
-  if (appIndex == 5) return "Config";
-  if (appIndex == 6) return "Settings";
-  if (appIndex == 7) return "About";
+  if (appIndex == 4) return "Location";
+  if (appIndex == 5) return "SD Card";
+  if (appIndex == 6) return "Config";
+  if (appIndex == 7) return "Settings";
+  if (appIndex == 8) return "About";
   return "Restart";
 }
 
@@ -1921,10 +2295,11 @@ String homeAppSubtitle(int appIndex) {
   if (appIndex == 1) return onlineNodesText();
   if (appIndex == 2) return "Messages";
   if (appIndex == 3) return "Nearby";
-  if (appIndex == 4) return sdReady ? "SD ready" : "No SD";
-  if (appIndex == 5) return String(configModes[configModeIndex]);
-  if (appIndex == 6) return String(brightnessPercent) + "%";
-  if (appIndex == 7) return String("Lomhor Chat ") + appVersion;
+  if (appIndex == 4) return gpsFixText();
+  if (appIndex == 5) return sdReady ? "SD ready" : "No SD";
+  if (appIndex == 6) return String(configModes[configModeIndex]);
+  if (appIndex == 7) return String(brightnessPercent) + "%";
+  if (appIndex == 8) return String("Lomhor Chat ") + appVersion;
   return "Reboot";
 }
 
@@ -1933,10 +2308,11 @@ uint16_t homeAppAccentColor(int appIndex) {
   if (appIndex == 1) return C_GREEN;
   if (appIndex == 2) return C_CYAN;
   if (appIndex == 3) return C_RED_SOFT;
-  if (appIndex == 4) return C_YELLOW;
-  if (appIndex == 5) return 0x7C3F;
-  if (appIndex == 6) return 0xFD20;
-  if (appIndex == 7) return 0xB79F;
+  if (appIndex == 4) return C_ACCENT;
+  if (appIndex == 5) return C_YELLOW;
+  if (appIndex == 6) return 0x7C3F;
+  if (appIndex == 7) return 0xFD20;
+  if (appIndex == 8) return C_ACCENT;
   return C_ERROR;
 }
 
@@ -1958,20 +2334,24 @@ void drawLauncherGlyph(int appIndex, int x, int y, uint16_t col) {
     tft.fillCircle(x + 21, y + 18, 3, C_ACCENT);
     tft.fillCircle(x + 28, y + 18, 3, C_ACCENT);
   } else if (appIndex == 4) {
+    tft.fillCircle(x + 20, y + 16, 15, col);
+    tft.fillTriangle(x + 20, y + 40, x + 7, y + 22, x + 33, y + 22, col);
+    tft.fillCircle(x + 20, y + 16, 6, C_ACCENT);
+  } else if (appIndex == 5) {
     tft.fillRoundRect(x + 11, y + 5, 20, 30, 2, col);
     tft.fillTriangle(x + 24, y + 5, x + 31, y + 12, x + 24, y + 12, C_ACCENT);
     tft.fillRect(x + 15, y + 27, 12, 3, C_ACCENT);
     tft.fillRect(x + 15, y + 10, 3, 7, C_ACCENT);
     tft.fillRect(x + 20, y + 10, 3, 7, C_ACCENT);
     tft.fillRect(x + 25, y + 10, 3, 7, C_ACCENT);
-  } else if (appIndex == 5) {
+  } else if (appIndex == 6) {
     tft.fillCircle(x + 18, y + 18, 16, 0xD6BA);
     tft.fillTriangle(x + 5, y + 9, x + 34, y + 23, x + 10, y + 31, 0xC618);
     tft.fillRect(x + 17, y + 25, 5, 10, C_MUTED);
     tft.drawLine(x + 23, y + 13, x + 34, y + 3, C_MUTED);
     tft.fillCircle(x + 34, y + 3, 4, C_ERROR);
     tft.fillRoundRect(x + 7, y + 35, 26, 4, 2, C_NAV_SLOT);
-  } else if (appIndex == 6) {
+  } else if (appIndex == 7) {
     tft.fillCircle(x + 20, y + 20, 15, col);
     for (int i = 0; i < 8; i++) {
       float a = i * PI / 4.0f;
@@ -1981,16 +2361,25 @@ void drawLauncherGlyph(int appIndex, int x, int y, uint16_t col) {
     }
     tft.fillCircle(x + 20, y + 20, 7, C_ACCENT);
     tft.fillCircle(x + 20, y + 20, 4, col);
-  } else if (appIndex == 7) {
-    tft.fillCircle(x + 20, y + 9, 4, col);
-    tft.fillRoundRect(x + 17, y + 16, 6, 18, 3, col);
-    tft.fillRoundRect(x + 13, y + 31, 14, 4, 2, col);
+  } else if (appIndex == 8) {
+    tft.drawRoundRect(x + 5, y + 8, 30, 25, 9, col);
+    tft.drawRoundRect(x + 6, y + 9, 28, 23, 8, col);
+    tft.drawRoundRect(x + 7, y + 10, 26, 21, 7, col);
+    tft.drawLine(x + 17, y + 32, x + 22, y + 39, col);
+    tft.drawLine(x + 18, y + 32, x + 23, y + 39, col);
+    tft.drawLine(x + 28, y + 32, x + 23, y + 39, col);
+    tft.drawLine(x + 29, y + 32, x + 24, y + 39, col);
+    tft.fillCircle(x + 20, y + 17, 7, col);
+    tft.fillCircle(x + 20, y + 17, 4, C_ACCENT);
+    tft.fillRoundRect(x + 17, y + 20, 6, 9, 3, col);
+    tft.fillRoundRect(x + 17, y + 32, 7, 5, 2, col);
   } else {
-    tft.drawCircle(x + 20, y + 20, 13, col);
-    tft.drawCircle(x + 20, y + 20, 12, col);
-    tft.fillRect(x + 20, y + 4, 13, 16, C_ACCENT);
-    tft.fillTriangle(x + 29, y + 8, x + 37, y + 12, x + 30, y + 17, col);
-    tft.fillRect(x + 28, y + 10, 7, 4, col);
+    tft.fillCircle(x + 20, y + 20, 17, col);
+    tft.fillCircle(x + 20, y + 20, 11, C_RESTART_BG);
+    tft.fillRect(x + 2, y + 14, 18, 13, C_RESTART_BG);
+    tft.fillTriangle(x + 5, y + 17, x + 16, y + 8, x + 20, y + 21, col);
+    tft.fillRect(x + 5, y + 14, 13, 9, col);
+    tft.fillRect(x + 15, y + 11, 7, 8, C_RESTART_BG);
   }
 }
 
@@ -2036,8 +2425,15 @@ void drawHomeAppTile(int appIndex, int slotIndex) {
 
   tft.fillRect(x - 2, y - 2, tileW + 4, tileH + 8, C_BG);
   int iconX = x + (tileW - LAUNCHER_ICON_SIZE) / 2;
-  if (appIndex >= 0 && appIndex < 9) {
-    tft.drawRGBBitmap(iconX, y, LAUNCHER_ICONS[appIndex], LAUNCHER_ICON_SIZE, LAUNCHER_ICON_SIZE);
+  int bitmapIndex = appIndex;
+  if (appIndex >= 5 && appIndex <= 8) bitmapIndex = appIndex - 1;
+  if (appIndex == 9) bitmapIndex = 8;
+
+  if (appIndex == 4) {
+    tft.fillRoundRect(iconX, y, LAUNCHER_ICON_SIZE, LAUNCHER_ICON_SIZE, 9, C_ACCENT);
+    drawLauncherGlyph(appIndex, iconX + 2, y + 2, C_TEXT);
+  } else if (bitmapIndex >= 0 && bitmapIndex < 9) {
+    tft.drawRGBBitmap(iconX, y, LAUNCHER_ICONS[bitmapIndex], LAUNCHER_ICON_SIZE, LAUNCHER_ICON_SIZE);
   } else {
     tft.fillRoundRect(iconX, y, LAUNCHER_ICON_SIZE, LAUNCHER_ICON_SIZE, 9, C_ACCENT);
     drawLauncherGlyph(appIndex, iconX + 2, y + 2, C_TEXT);
@@ -2144,30 +2540,63 @@ void drawHomeInfoPanel(int x, int y, int w, String title, String line1, String l
   tft.print(fitDashboardText(line3, (w - 16) / 6));
 }
 
-void drawHomeStatus() {
+void drawHomeTopStatusIcons() {
+  lastHomeTopStatusRefresh = millis();
+  drawTopWifiIcon(226, 12, C_TEXT);
+  drawTopGpsIcon(251, 12, gpsHasFix ? C_TEXT : C_ERROR);
+  drawTopRadioIcon(273, 11, e22Ready ? C_TEXT : C_ERROR);
+  uint16_t batteryMv = readBatteryMv();
+  int battPercent = batteryPercentFromMv(batteryMv);
+  drawTopBatteryIcon(302, 12, batteryColor(battPercent), battPercent);
+}
+
+void drawHomeClockValues() {
   lastHomeClockRefresh = millis();
-  String dateText = currentLauncherDateText();
-  String upText = uptimeText();
+
+  tft.setTextSize(2);
+  tft.fillRect(14, 55, 180, 18, C_BG);
+  tft.setTextColor(C_TEXT);
+  tft.setCursor(14, 55);
+  tft.print(currentLauncherDateText());
+
+  tft.setTextSize(1);
+  tft.fillRect(15, 78, 170, 10, C_BG);
+  tft.setTextColor(C_TEXT);
+  tft.setCursor(15, 78);
+  tft.print(uptimeText());
+}
+
+void drawHomeHeaderBackground() {
+  const uint16_t headerColor = 0x055E;
+  const int headerY = 0;
+  const int headerH = 45;
+  const int wedgeStartX = 210;
+  const int wedgeEndX = 235;
+  const int wedgeOffsetX = 16;
 
   tft.fillScreen(C_BG);
+  tft.fillRect(236, headerY, 84, headerH, headerColor);
+
+  for (int x = wedgeStartX; x <= wedgeEndX; x++) {
+    tft.drawLine(x, headerY, x + wedgeOffsetX, headerH - 2, headerColor);
+    if (x > wedgeStartX) {
+      tft.drawLine(x, headerY, x + wedgeOffsetX, headerH - 1, headerColor);
+    }
+  }
+}
+
+
+
+void drawHomeStatus() {
+  drawHomeHeaderBackground();
 
   tft.setTextSize(3);
   tft.setTextColor(C_TEXT);
   tft.setCursor(14, 14);
   tft.print("LomhorOS");
 
-  drawTopWifiIcon(235, 10, C_TEXT);
-  drawTopRadioIcon(268, 9, e22Ready ? C_TEXT : C_ERROR);
-  drawTopBatteryIcon(303, 10, C_ERROR, 100);
-  
-  tft.setTextSize(2);
-  tft.setCursor(14, 55);
-  tft.print(dateText);
-
-  tft.setTextSize(1);
-  tft.setTextColor(C_TEXT);
-  tft.setCursor(15, 78);
-  tft.print(upText);
+  drawHomeTopStatusIcons();
+  drawHomeClockValues();
 
   drawHomeAppList();
 }
@@ -2185,11 +2614,17 @@ void drawHomeDetailsContent(bool fullRedraw) {
   String radioText = e22Ready ? String(configPowers[configPowerIndex]) : "E22 offline";
   String rssiText = lastRssiSignal <= -250 ? "-- dBm" : String(lastRssiSignal) + " dBm";
   String trafficText = String(sentCount) + " TX / " + String(receivedCount) + " RX";
+  String wifiText = wifiApEnabled ? (wifiApReady ? wifiApSsid() : "WiFi AP starting") : "WiFi AP off";
+  String bleText = bluetoothEnabled ? (bluetoothReady ? networkDeviceName() : "BLE starting") : "BLE off";
+  uint16_t batteryMv = readBatteryMv();
+  int battPercent = batteryPercentFromMv(batteryMv);
+  String batteryText = String(batteryMv / 1000.0f, 2) + "V  " + String(battPercent) + "%";
   String values[HOME_DETAILS_ROW_COUNT] = {
     HARDWARE_TARGET,
     heapText,
     flashText + "  " + psramText,
     String("Brightness ") + String(brightnessPercent) + "%",
+    batteryText,
     String("Alert ") + (alertSoundOn ? "ON" : "OFF") + "  Sleep " + sleepModes[sleepModeIndex],
     nodeText,
     netText + "  " + radioFrequencyText(),
@@ -2197,6 +2632,8 @@ void drawHomeDetailsContent(bool fullRedraw) {
     radioText,
     String(configModes[configModeIndex]),
     rssiText + "  " + trafficText,
+    wifiText,
+    bleText,
     sdReady ? "SD ready" : "No SD",
     lastRxMessage
   };
@@ -2205,6 +2642,7 @@ void drawHomeDetailsContent(bool fullRedraw) {
     "Memory",
     "Storage",
     "Display",
+    "Battery",
     "Settings",
     "E22 Address",
     "Network",
@@ -2212,15 +2650,18 @@ void drawHomeDetailsContent(bool fullRedraw) {
     "Power",
     "Mode",
     "Signal",
+    "WiFi AP",
+    "Bluetooth",
     "SD Card",
     "Last RX"
   };
-  int icons[HOME_DETAILS_ROW_COUNT] = {4, 4, 3, 4, 4, 1, 2, 4, 2, 4, 2, 3, 0};
+  int icons[HOME_DETAILS_ROW_COUNT] = {4, 4, 3, 4, 4, 4, 1, 2, 4, 2, 4, 2, 2, 2, 3, 0};
   uint16_t colors[HOME_DETAILS_ROW_COUNT] = {
-    C_ACCENT, C_TEXT, C_TEXT, C_TEXT, C_TEXT,
-    C_ACCENT, C_ACCENT, C_MUTED, e22Ready ? C_ACCENT : C_ERROR,
-    C_TEXT, lastRssiSignal <= -250 ? C_MUTED : C_ACCENT,
-    sdReady ? C_ACCENT : C_ERROR, C_TEXT
+    C_ACCENT, C_TEXT, C_TEXT, C_TEXT, (uint16_t)(battPercent <= 15 ? C_ERROR : (battPercent <= 30 ? C_WARN : C_ACCENT)), C_TEXT,
+    C_ACCENT, C_ACCENT, C_MUTED, (uint16_t)(e22Ready ? C_ACCENT : C_ERROR),
+    C_TEXT, (uint16_t)(lastRssiSignal <= -250 ? C_MUTED : C_ACCENT),
+    (uint16_t)(wifiApReady ? C_CYAN : C_MUTED), (uint16_t)(bluetoothReady ? C_CYAN : C_MUTED),
+    (uint16_t)(sdReady ? C_ACCENT : C_ERROR), C_TEXT
   };
 
   int maxTop = HOME_DETAILS_ROW_COUNT - HOME_DETAILS_VISIBLE_ROWS;
@@ -2450,43 +2891,52 @@ void drawUserContent() {
 
 void drawAboutScreen() {
   screenMode = SCREEN_ABOUT;
-  sidebarTab = 7;
+  sidebarTab = 8;
   clearContentArea();
   drawSidebar();
 
   drawCardBorder(PANEL_X, PANEL_Y, PANEL_W, PANEL_H);
   drawHeader("About");
 
-  int x = PANEL_X + PANEL_INSET;
-  int y = BODY_Y + 14;
+  int centerX = PANEL_X + PANEL_W / 2;
+  int y = BODY_Y + 24;
+  int iconSize = LAUNCHER_ICON_SIZE;
+  int titleW = 11 * 6;
+  int titleGroupW = iconSize + 8 + titleW;
+  int x = centerX - titleGroupW / 2;
 
-  drawIconInfo(x, y, C_ACCENT);
+  tft.drawRGBBitmap(x, y - 8, LAUNCHER_ICONS[7], iconSize, iconSize);
   tft.setTextSize(1);
   tft.setTextColor(C_ACCENT);
-  tft.setCursor(x + 24, y + 2);
+  tft.setCursor(x + iconSize + 8, y + 2);
   tft.print("Lomhor Chat");
   tft.setTextColor(C_MUTED);
-  tft.setCursor(x + 24, y + 16);
+  tft.setCursor(x + iconSize + 8, y + 18);
   tft.print(appVersion);
 
-  y += 48;
+  y += 52;
   tft.setTextColor(C_TEXT);
-  tft.setCursor(x, y);
-  tft.print("LoRa chat of Cambodia.");
+  String line = "LoRa chat of Cambodia.";
+  tft.setCursor(centerX - line.length() * 3, y);
+  tft.print(line);
   y += 18;
   tft.setTextColor(C_MUTED);
-  tft.setCursor(x, y);
-  tft.print("Offline mesh messaging");
+  line = "Offline mesh messaging";
+  tft.setCursor(centerX - line.length() * 3, y);
+  tft.print(line);
   y += 14;
-  tft.setCursor(x, y);
-  tft.print("for local communities,");
+  line = "for local communities,";
+  tft.setCursor(centerX - line.length() * 3, y);
+  tft.print(line);
   y += 14;
-  tft.setCursor(x, y);
-  tft.print("field teams, and makers.");
+  line = "field teams, and makers.";
+  tft.setCursor(centerX - line.length() * 3, y);
+  tft.print(line);
   y += 24;
   tft.setTextColor(C_ACCENT);
-  tft.setCursor(x, y);
-  tft.print("Cambodia LoRa network");
+  line = "Cambodia LoRa network";
+  tft.setCursor(centerX - line.length() * 3, y);
+  tft.print(line);
 
 }
 
@@ -2498,11 +2948,12 @@ void openTab(int tab) {
   if (tab == 1) { drawUserScreen(); return; }
   if (tab == 2) { drawChatPresetScreen(); return; }
   if (tab == 3) { drawMapScreen(); return; }
-  if (tab == 4) { sdInfoScreen(); return; }
-  if (tab == 5) { drawConfigMenu(); return; }
-  if (tab == 6) { drawSettingsMenu(); return; }
-  if (tab == 7) { drawAboutScreen(); return; }
-  if (tab == 8) {
+  if (tab == 4) { drawLocationScreen(); return; }
+  if (tab == 5) { sdInfoScreen(); return; }
+  if (tab == 6) { drawConfigMenu(); return; }
+  if (tab == 7) { drawSettingsMenu(); return; }
+  if (tab == 8) { drawAboutScreen(); return; }
+  if (tab == 9) {
     saveSettingsToStorage();
     saveConfigToStorage();
     showRestartLoadingScreen();
@@ -2514,7 +2965,7 @@ void openTab(int tab) {
   clearContentArea();
   sidebarTab = tab;
   drawSidebar();
-  String titles[] = {"Home","User","Chat","Map","Records","Config","Settings","About","Restart"};
+  String titles[] = {"Home","User","Chat","Map","Location","Records","Config","Settings","About","Restart"};
   int cx = PANEL_X, cy = PANEL_Y;
   drawCardBorder(cx, cy, PANEL_W, PANEL_H);
   drawHeader(titles[tab]);
@@ -2658,6 +3109,219 @@ void handleMapScreen(String joy) {
     returnToHomeTab();
   } else if (joy == "SELECT") {
     drawMapContent();
+  }
+}
+
+// ===================== LOCATION SCREEN =====================
+
+void drawLocationRow(int x, int y, String label, String value, uint16_t valueCol) {
+  int w = PANEL_W - PANEL_INSET * 2;
+  tft.fillRoundRect(x, y, w, 21, 4, (y / 21) % 2 == 0 ? C_TILE_BG : C_CARD_BG);
+  tft.setTextSize(1);
+  tft.setTextColor(C_MUTED);
+  tft.setCursor(x + 8, y + 7);
+  tft.print(label);
+  tft.setTextColor(valueCol);
+  int valueX = x + 108;
+  if (value.length() > 31) value = value.substring(0, 29) + "..";
+  tft.setCursor(valueX, y + 7);
+  tft.print(value);
+}
+
+void ensureLocationVisible() {
+  int maxTop = LOCATION_ROW_COUNT - LOCATION_VISIBLE_ROWS;
+  if (maxTop < 0) maxTop = 0;
+  if (locationTopIndex < 0) locationTopIndex = 0;
+  if (locationTopIndex > maxTop) locationTopIndex = maxTop;
+}
+
+String gpsAgeText(unsigned long timestamp) {
+  if (timestamp == 0) return "--";
+  unsigned long age = (millis() - timestamp) / 1000UL;
+  if (age > 999) return ">999s";
+  return String(age) + "s";
+}
+
+String locationRowLabel(int rowIndex) {
+  if (rowIndex == 0) return "Latitude";
+  if (rowIndex == 1) return "Longitude";
+  if (rowIndex == 2) return "Altitude";
+  if (rowIndex == 3) return "Speed";
+  if (rowIndex == 4) return "Course";
+  if (rowIndex == 5) return "Sat / HDOP";
+  if (rowIndex == 6) return "UTC";
+  if (rowIndex == 7) return "UART";
+  if (rowIndex == 8) return "I2C";
+  return "Last fix";
+}
+
+String locationRowValue(int rowIndex) {
+  if (rowIndex == 0) return gpsHasFix ? formatDecimalDegrees(gpsLatitude) : "--";
+  if (rowIndex == 1) return gpsHasFix ? formatDecimalDegrees(gpsLongitude) : "--";
+  if (rowIndex == 2) return gpsHasFix ? String(gpsAltitudeM, 1) + " m" : "--";
+  if (rowIndex == 3) return gpsHasFix ? String(gpsSpeedKmh, 1) + " km/h" : "--";
+  if (rowIndex == 4) return gpsHasFix ? String(gpsCourseDeg, 1) + " deg" : "--";
+  if (rowIndex == 5) return String(gpsSatellites) + " / " + String(gpsHdop, 1);
+  if (rowIndex == 6) return gpsUtcDate + " " + gpsUtcTime;
+  if (rowIndex == 7) return millis() - lastGpsCharMs <= 4000UL ? "NMEA RX " + gpsAgeText(lastGpsCharMs) : "No NMEA";
+  if (rowIndex == 8) return gpsI2cReady ? "Device ACK" : "No ACK";
+  return gpsHasFix ? gpsAgeText(lastGpsFixMs) : "--";
+}
+
+uint16_t locationRowColor(int rowIndex) {
+  if (rowIndex == 0 || rowIndex == 1 || rowIndex == 2 || rowIndex == 3 || rowIndex == 4) return gpsHasFix ? C_TEXT : C_MUTED;
+  if (rowIndex == 5) return gpsSatellites > 0 ? C_ACCENT : C_MUTED;
+  if (rowIndex == 6) return gpsDateValid ? C_TEXT : C_MUTED;
+  if (rowIndex == 7) return millis() - lastGpsCharMs <= 4000UL ? C_ACCENT : C_WARN;
+  if (rowIndex == 8) return gpsI2cReady ? C_CYAN : C_MUTED;
+  return gpsHasFix ? C_ACCENT : C_MUTED;
+}
+
+void drawLocationScrollbar(int x, int y, int h) {
+  if (LOCATION_ROW_COUNT <= LOCATION_VISIBLE_ROWS) return;
+
+  int maxTop = LOCATION_ROW_COUNT - LOCATION_VISIBLE_ROWS;
+  int thumbH = h * LOCATION_VISIBLE_ROWS / LOCATION_ROW_COUNT;
+  if (thumbH < 18) thumbH = 18;
+  int thumbY = y + (h - thumbH) * locationTopIndex / maxTop;
+
+  tft.fillRoundRect(x, y, 3, h, 2, C_NAV_SLOT);
+  tft.fillRoundRect(x, thumbY, 3, thumbH, 2, C_ACCENT);
+}
+
+String compassDirectionText(float degrees) {
+  while (degrees < 0.0f) degrees += 360.0f;
+  while (degrees >= 360.0f) degrees -= 360.0f;
+  const char* dirs[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+  int index = (int)((degrees + 22.5f) / 45.0f) % 8;
+  return String(dirs[index]);
+}
+
+void drawLocationCompass(int x, int y, int w, int h) {
+  tft.fillRoundRect(x, y, w, h, 7, C_PANEL);
+  tft.drawRoundRect(x, y, w, h, 7, C_BORDER);
+
+  int cx = x + 48;
+  int cy = y + h / 2;
+  int r = 25;
+  uint16_t dialCol = gpsHasFix ? C_ACCENT : C_MUTED;
+  float course = gpsHasFix ? gpsCourseDeg : 0.0f;
+  float angle = (course - 90.0f) * PI / 180.0f;
+  int tipX = cx + cos(angle) * (r - 11);
+  int tipY = cy + sin(angle) * (r - 11);
+  int tailX = cx - cos(angle) * 5;
+  int tailY = cy - sin(angle) * 5;
+
+  tft.drawCircle(cx, cy, r, dialCol);
+  tft.drawCircle(cx, cy, r - 1, dialCol);
+  tft.drawCircle(cx, cy, r - 7, C_NAV_SLOT);
+  tft.setTextSize(1);
+  tft.setTextColor(C_TEXT);
+  tft.setCursor(cx - 3, cy - r - 9);
+  tft.print("N");
+  tft.setTextColor(C_MUTED);
+  tft.setCursor(cx + r + 6, cy - 3);
+  tft.print("E");
+  tft.setCursor(cx - 3, cy + r + 3);
+  tft.print("S");
+  tft.setCursor(cx - r - 12, cy - 3);
+  tft.print("W");
+
+  tft.drawLine(tailX, tailY, tipX, tipY, dialCol);
+  tft.fillCircle(tipX, tipY, 2, gpsHasFix ? C_WARN : C_MUTED);
+  tft.fillCircle(cx, cy, 2, C_TEXT);
+
+  int textX = x + 96;
+  tft.setTextColor(gpsHasFix ? C_ACCENT : C_WARN);
+  tft.setCursor(textX, y + 9);
+  tft.print(gpsHasFix ? "Compass" : "Compass --");
+
+  tft.setTextColor(C_TEXT);
+  tft.setCursor(textX, y + 25);
+  if (gpsHasFix) {
+    tft.print(compassDirectionText(course));
+    tft.print(" ");
+    tft.print(course, 1);
+    tft.print(" deg");
+  } else {
+    tft.print("Waiting for GPS course");
+  }
+
+  tft.setTextColor(C_MUTED);
+  tft.setCursor(textX, y + 49);
+  String status = gpsStatusText;
+  if (millis() - lastGpsCharMs <= 4000UL) status += " NMEA";
+  tft.print(fitDashboardText(status, 30));
+}
+
+void drawLocationHeaderValues(int x, int y, int w) {
+  tft.drawRoundRect(x, y, w, 32, 7, gpsHasFix ? C_ACCENT : C_CARD_BG);
+  tft.fillRect(x + 8, y + 7, 22, 18, C_HEADER_BG);
+  drawIconMap(x + 10, y + 8, gpsHasFix ? C_ACCENT : C_MUTED);
+
+  tft.setTextSize(1);
+  tft.setTextColor(C_MUTED);
+  tft.fillRect(x + 36, y + 7, 70, 8, C_HEADER_BG);
+  tft.setCursor(x + 36, y + 7);
+  tft.print("GPS");
+
+  tft.setTextColor(gpsHasFix ? C_ACCENT : C_WARN);
+  tft.fillRect(x + 36, y + 19, 150, 8, C_HEADER_BG);
+  tft.setCursor(x + 36, y + 19);
+  tft.print(gpsFixText());
+
+  tft.setTextColor(gpsI2cReady ? C_CYAN : C_MUTED);
+  tft.fillRect(x + w - 74, y + 13, 66, 8, C_HEADER_BG);
+  tft.setCursor(x + w - 70, y + 13);
+  tft.print(gpsI2cReady ? "I2C OK" : "I2C --");
+}
+
+void drawLocationContent(bool fullRedraw = true) {
+  ensureLocationVisible();
+  int x = PANEL_X + PANEL_INSET;
+  int w = PANEL_W - PANEL_INSET * 2;
+  int y = BODY_Y + 6;
+
+  if (fullRedraw) {
+    tft.fillRect(x, BODY_Y, w, 190, C_BG);
+    tft.fillRoundRect(x, y, w, 32, 7, C_HEADER_BG);
+  }
+  drawLocationHeaderValues(x, y, w);
+
+  y += 42;
+  for (int slot = 0; slot < LOCATION_VISIBLE_ROWS; slot++) {
+    int rowIndex = locationTopIndex + slot;
+    if (rowIndex >= LOCATION_ROW_COUNT) break;
+    drawLocationRow(x, y + slot * 23, locationRowLabel(rowIndex), locationRowValue(rowIndex), locationRowColor(rowIndex));
+  }
+  drawLocationScrollbar(x + w - 5, y, LOCATION_VISIBLE_ROWS * 23 - 2);
+
+  drawLocationCompass(x, FOOTER_Y - 74, w, 74);
+}
+
+void drawLocationScreen() {
+  screenMode = SCREEN_LOCATION;
+  sidebarTab = 4;
+  locationTopIndex = 0;
+  clearContentArea();
+  drawSidebar();
+  drawCardBorder(PANEL_X, PANEL_Y, PANEL_W, PANEL_H);
+  drawHeader("Location");
+  drawLocationContent();
+}
+
+void handleLocationScreen(String joy) {
+  if (joy == "UP") {
+    locationTopIndex--;
+    drawLocationContent();
+  } else if (joy == "DOWN") {
+    locationTopIndex++;
+    drawLocationContent();
+  } else if (joy == "LEFT") {
+    returnToHomeTab();
+  } else if (joy == "SELECT") {
+    gpsI2cReady = scanGpsI2cBus();
+    drawLocationContent();
   }
 }
 
@@ -2813,23 +3477,25 @@ void drawFreeTextValue() {
   int x = PANEL_X + 10;
   int y = 38;
   int w = PANEL_W - 20;
+  String text = keyboardEditingWifiPassword ? wifiPasswordEdit : freeTextMessage;
+  int maxLen = keyboardEditingWifiPassword ? 63 : 64;
   tft.fillRoundRect(x, y, w, 42, 8, C_PANEL);
-  tft.drawRoundRect(x, y, w, 42, 8, C_ACCENT);
+  tft.drawRoundRect(x, y, w, 42, 8, wifiPasswordTooShort ? C_WARN : C_ACCENT);
 
-  String shown = freeTextMessage;
-  if (shown.length() == 0) shown = "Type message...";
+  String shown = text;
+  if (shown.length() == 0) shown = keyboardEditingWifiPassword ? "Type 8-63 chars..." : "Type message...";
   if (shown.length() > 34) shown = shown.substring(shown.length() - 34);
 
   tft.setTextSize(1);
   tft.setTextColor(C_MUTED);
   tft.setCursor(x + 8, y + 6);
-  tft.print("Message");
-  tft.setTextColor(freeTextMessage.length() == 0 ? C_MUTED : C_TEXT);
+  tft.print(keyboardEditingWifiPassword ? "WiFi Password" : "Message");
+  tft.setTextColor(text.length() == 0 ? C_MUTED : C_TEXT);
   tft.setCursor(x + 8, y + 23);
   tft.print(shown);
 
-  String countText = String(freeTextMessage.length()) + "/64";
-  tft.setTextColor(freeTextMessage.length() >= 60 ? C_WARN : C_MUTED);
+  String countText = String(text.length()) + "/" + String(maxLen);
+  tft.setTextColor((keyboardEditingWifiPassword && text.length() < 8) || text.length() >= maxLen - 4 ? C_WARN : C_MUTED);
   tft.setCursor(x + w - countText.length() * 6 - 8, y + 6);
   tft.print(countText);
 }
@@ -2853,6 +3519,7 @@ void drawKeyboardKey(int i, bool selected) {
   int x = x0 + col * (keyW + gap);
   int y = y0 + row * (keyH + gap);
   String label = keyboardKeys[i];
+  String shownLabel = (keyboardEditingWifiPassword && label == "SEND") ? "SAVE" : label;
   uint16_t fillCol = keyboardKeyColor(label, selected);
   uint16_t borderCol = selected ? C_TEXT : C_BORDER;
   uint16_t textCol = C_TEXT;
@@ -2863,10 +3530,10 @@ void drawKeyboardKey(int i, bool selected) {
   if (selected) tft.drawRoundRect(x - 2, y - 2, keyW + 4, keyH + 4, 7, C_ACCENT);
   tft.setTextSize(1);
   tft.setTextColor(textCol);
-  int tx = x + (keyW - label.length() * 6) / 2;
+  int tx = x + (keyW - shownLabel.length() * 6) / 2;
   if (tx < x + 2) tx = x + 2;
   tft.setCursor(tx, y + 7);
-  tft.print(label);
+  tft.print(shownLabel);
 }
 
 void drawKeyboardGrid() {
@@ -2882,6 +3549,8 @@ void drawKeyboardGrid() {
 }
 
 void drawFreeTextKeyboard() {
+  keyboardEditingWifiPassword = false;
+  wifiPasswordTooShort = false;
   screenMode = SCREEN_CHAT_KEYBOARD;
   sidebarTab = 2;
   tft.fillScreen(C_BG);
@@ -2897,16 +3566,50 @@ void drawFreeTextKeyboard() {
   drawKeyboardGrid();
 }
 
+void drawWifiPasswordKeyboard() {
+  keyboardEditingWifiPassword = true;
+  wifiPasswordTooShort = false;
+  wifiPasswordEdit = wifiApPassword;
+  screenMode = SCREEN_CHAT_KEYBOARD;
+  sidebarTab = 7;
+  tft.fillScreen(C_BG);
+  tft.fillRoundRect(8, 6, 304, 25, 8, C_ACCENT);
+  tft.setTextSize(2);
+  tft.setTextColor(C_TEXT);
+  tft.setCursor(16, 11);
+  tft.print("WiFi Pass");
+  tft.setTextSize(1);
+  tft.setCursor(262, 15);
+  tft.print("AP");
+  drawFreeTextValue();
+  drawKeyboardGrid();
+}
+
 void pressKeyboardKey() {
   String key = keyboardKeys[keyboardIndex];
+  String *text = keyboardEditingWifiPassword ? &wifiPasswordEdit : &freeTextMessage;
+  int maxLen = keyboardEditingWifiPassword ? 63 : 64;
   if (key == "SP") {
-    if (freeTextMessage.length() < 64) freeTextMessage += " ";
+    if (text->length() < maxLen) *text += " ";
   } else if (key == "DEL") {
-    if (freeTextMessage.length() > 0) freeTextMessage.remove(freeTextMessage.length() - 1);
+    if (text->length() > 0) text->remove(text->length() - 1);
   } else if (key == "BACK") {
-    drawChatPresetScreen();
+    if (keyboardEditingWifiPassword) drawSettingsMenu();
+    else drawChatPresetScreen();
     return;
   } else if (key == "SEND") {
+    if (keyboardEditingWifiPassword) {
+      if (wifiPasswordEdit.length() < 8) {
+        wifiPasswordTooShort = true;
+        drawFreeTextValue();
+        return;
+      }
+      wifiApPassword = wifiPasswordEdit;
+      saveSettingsToStorage();
+      initWifiAccessPoint();
+      drawSettingsMenu();
+      return;
+    }
     if (freeTextMessage.length() == 0) {
       return;
     }
@@ -2915,8 +3618,9 @@ void pressKeyboardKey() {
     drawChatSendTargetScreen();
     return;
   } else {
-    if (freeTextMessage.length() < 64) freeTextMessage += key;
+    if (text->length() < maxLen) *text += key;
   }
+  wifiPasswordTooShort = false;
   drawFreeTextValue();
 }
 
@@ -3385,7 +4089,7 @@ void drawConfigRow(int i, bool selected) {
 
 void drawConfigMenu() {
   screenMode = SCREEN_CONFIG;
-  sidebarTab = 5;
+  sidebarTab = 6;
   clearContentArea();
   drawSidebar();
   drawCardBorder(PANEL_X, PANEL_Y, PANEL_W, PANEL_H);
@@ -3450,11 +4154,14 @@ void drawSettingsRow(int i, bool selected) {
   if (i == 0) drawMenuRow(i, settingsIndex, "Brightness", getSettingsValue(i), 2);
   else if (i == 1) drawMenuRow(i, settingsIndex, "Alert sound", getSettingsValue(i), 4);
   else if (i == 2) drawMenuRow(i, settingsIndex, "Sleep mode", getSettingsValue(i), 4);
+  else if (i == 3) drawMenuRow(i, settingsIndex, "WiFi AP", getSettingsValue(i), 1);
+  else if (i == 4) drawMenuRow(i, settingsIndex, "WiFi Pass", getSettingsValue(i), 4);
+  else if (i == 5) drawMenuRow(i, settingsIndex, "Bluetooth BLE", getSettingsValue(i), 1);
 }
 
 void drawSettingsMenu() {
   screenMode = SCREEN_SETTINGS;
-  sidebarTab = 6;
+  sidebarTab = 7;
   clearContentArea();
   drawSidebar();
   drawCardBorder(PANEL_X, PANEL_Y, PANEL_W, PANEL_H);
@@ -3476,6 +4183,10 @@ void handleSettings(String joy) {
     drawSettingsRow(old, false); drawSettingsRow(settingsIndex, true);
   }
   else if (joy == "SELECT") {
+    if (settingsIndex == 4) {
+      drawWifiPasswordKeyboard();
+      return;
+    }
     optionGroup = 0;
     optionItem = settingsIndex;
     drawOptionEditor();
@@ -3492,7 +4203,10 @@ String getOptionTitle() {
   }
   if (optionItem == 0) return "Settings > Brightness";
   if (optionItem == 1) return "Settings > Alert";
-  return "Settings > Sleep";
+  if (optionItem == 2) return "Settings > Sleep";
+  if (optionItem == 3) return "Settings > WiFi AP";
+  if (optionItem == 4) return "Settings > WiFi Pass";
+  return "Settings > Bluetooth";
 }
 
 String getOptionValue() {
@@ -3555,11 +4269,27 @@ void adjustOption(int dir) {
     } else if (optionItem == 1) {
       alertSoundOn = !alertSoundOn;
       shouldSaveSettings = true;
-    } else {
+    } else if (optionItem == 2) {
       sleepModeIndex += dir;
       if (sleepModeIndex < 0) sleepModeIndex = 4;
       if (sleepModeIndex > 4) sleepModeIndex = 0;
       shouldSaveSettings = true;
+    } else if (optionItem == 3) {
+      wifiApEnabled = !wifiApEnabled;
+      initWifiAccessPoint();
+      shouldSaveSettings = true;
+    } else if (optionItem == 4) {
+      return;
+    } else {
+#if ENABLE_BLE_NETWORK
+      bluetoothEnabled = !bluetoothEnabled;
+      initBluetoothBle();
+      shouldSaveSettings = true;
+#else
+      bluetoothEnabled = false;
+      bluetoothReady = false;
+      shouldSaveSettings = true;
+#endif
     }
   }
 
@@ -3747,7 +4477,7 @@ void handleSdInfo(String joy) {
 
 void sdInfoScreen() {
   screenMode = SCREEN_SD_INFO;
-  sidebarTab = 4;
+  sidebarTab = 5;
   clearContentArea();
   drawSidebar();
   drawCardBorder(PANEL_X, PANEL_Y, PANEL_W, PANEL_H);
@@ -3868,13 +4598,17 @@ void setup() {
   applyBrightness();
 
   printHardwareReport();
+  initNetworkDevices();
+  initGps();
   initE22Radio();
 
   pinMode(JOY_PIN, INPUT_PULLUP);
+  pinMode(BATTERY_PIN, INPUT);
   pinMode(BACK_BTN_PIN, INPUT_PULLUP);
   pinMode(HOME_BTN_PIN, INPUT_PULLUP);
   analogReadResolution(12);
   analogSetPinAttenuation(JOY_PIN, ADC_11db);
+  analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
 
   pinMode(TFT_CS, OUTPUT); pinMode(SD_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH); digitalWrite(SD_CS, HIGH);
@@ -3896,6 +4630,7 @@ void setup() {
 // ===================== LOOP =====================
 
 void loop() {
+  pollGps();
   pollE22Radio();
   sendNodeBeacon();
 
@@ -3910,8 +4645,16 @@ void loop() {
   }
 
   if (!displaySleeping && screenMode == SCREEN_HOME && millis() - lastHomeClockRefresh > 60000UL) {
-    lastHomeClockRefresh = millis();
-    drawHomeStatus();
+    drawHomeClockValues();
+  }
+
+  if (!displaySleeping && screenMode == SCREEN_HOME && millis() - lastHomeTopStatusRefresh > 1000UL) {
+    drawHomeTopStatusIcons();
+  }
+
+  if (!displaySleeping && screenMode == SCREEN_LOCATION && millis() - lastGpsUiRefresh > 1000UL) {
+    lastGpsUiRefresh = millis();
+    drawLocationContent(false);
   }
 
   String joy = getJoyPressed();
@@ -3956,6 +4699,9 @@ void loop() {
   }
   else if (screenMode == SCREEN_MAP) {
     handleMapScreen(joy);
+  }
+  else if (screenMode == SCREEN_LOCATION) {
+    handleLocationScreen(joy);
   }
   else if (screenMode == SCREEN_FILE_MANAGER) {
     handleFileManager(joy);
